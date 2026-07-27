@@ -15,7 +15,7 @@ import {
   readTicketsViaExport, storeCacheKey, makeKeyedCache, readFleetStatus,
 } from '../lib/adlc-state.mjs';
 import { buildPaneMap } from '../lib/panemap.mjs';
-import { renderBoard, boardFooter } from '../lib/board-render.mjs';
+import { renderBoard, boardFooter, composeFrame, frameGeometry, withCurrentGeometry } from '../lib/board-render.mjs';
 import { planFleetBridge, KNOWN_FLEET_SCHEMA_VERSION } from '../lib/fleet-bridge.mjs';
 import { flattenGroups, nextSelectedId, focusSelected, classifyKey, redrawBoard } from '../lib/board-nav.mjs';
 
@@ -65,10 +65,7 @@ async function gather(repoRoot) {
       ticket: byId.get(e.paneId)?.tokens?.ticket ?? null,
     }));
   return {
-    width: process.stdout.columns ?? 80,
-    // Reserve two lines for the blank + footer draw() adds, so the whole frame
-    // fits the pane and cursor-home redraw never scrolls/duplicates.
-    height: process.stdout.rows ? Math.max(4, process.stdout.rows - 2) : null,
+    ...frameGeometry({ columns: process.stdout.columns, rows: process.stdout.rows }),
     repoRoot,
     active,
     phase,
@@ -88,9 +85,8 @@ function draw(body) {
   // Probed 2026-07-23: \x1b[2J leaves a herdr pane blank AND unreadable via
   // `pane read` — redraw with cursor-home + per-line erase-to-EOL + erase-
   // below instead of a full clear.
-  const footer = boardFooter(REFRESH_MS);
-  const frameText = `${body}\n\n${footer}`.split('\n').map((line) => `${line}\x1b[K`).join('\n');
-  process.stdout.write(`\x1b[H${frameText}\n\x1b[0J`);
+  const footer = boardFooter(REFRESH_MS, frameGeometry({ columns: process.stdout.columns }).width);
+  process.stdout.write(composeFrame(body, footer, process.stdout.rows));
 }
 
 // Single-flight latch: gather() runs several herdr subprocess calls plus an
@@ -119,7 +115,11 @@ async function frame(repoRoot) {
 // redrawBoard suppresses the draw until the first frame has loaded, so an early
 // keypress can't wipe the "loading…" screen.
 function redraw() {
-  redrawBoard({ props: lastProps, selectedId, render: renderBoard, draw });
+  // Geometry from the terminal NOW, not from whenever gather() last ran — a
+  // keypress during a resize would otherwise redraw the old width into the new
+  // pane, and gather() is async and can fail.
+  const props = withCurrentGeometry(lastProps, { columns: process.stdout.columns, rows: process.stdout.rows });
+  redrawBoard({ props, selectedId, render: renderBoard, draw });
 }
 
 function move(direction) {
@@ -172,7 +172,15 @@ async function main() {
   await frame(repoRoot);
   trace('first frame done');
   const timer = setInterval(() => frame(repoRoot).catch(() => {}), REFRESH_MS);
-  process.stdout.on('resize', () => frame(repoRoot).catch(() => {}));
+  process.stdout.on('resize', () => {
+    // Redraw the CACHED frame at the new geometry first. frame() awaits
+    // gather(), which runs herdr subprocesses and a ticket-store export with
+    // a 15s timeout — and the single-flight latch may drop this call outright.
+    // Waiting for it leaves the old geometry on screen, wrapping and scrolling,
+    // for as long as collection takes, or forever if collection keeps failing.
+    redraw();
+    frame(repoRoot).catch(() => {});
+  });
   armInput(() => {
     clearInterval(timer);
     process.exit(0);
